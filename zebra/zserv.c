@@ -1685,6 +1685,180 @@ DEFPY (show_zebra_client_summary,
 	return CMD_SUCCESS;
 }
 
+/*
+ * Per-command dispatch table for "show zebra client fifo detail".
+ * NULL entries fall back to hex dump.
+ *
+ * To add a formatter for a new ZAPI message type:
+ *   1. Write: void my_msg_show(struct vty *, struct stream *, uint16_t)
+ *   2. Declare it in the appropriate header
+ *   3. Register in zserv_init():
+ *        zapi_msg_show_fns[ZEBRA_MY_MSG] = my_msg_show;
+ */
+static zapi_msg_show_t zapi_msg_show_fns[ZEBRA_MSG_MAX];
+
+static void zapi_msg_show_hexdump(struct vty *vty, struct stream *s, uint32_t max_bytes)
+{
+	size_t dump_len = MIN(max_bytes, stream_get_endp(s));
+	size_t j;
+
+	for (j = 0; j < dump_len; j++) {
+		if (j % 16 == 0)
+			vty_out(vty, "         %04zx:", j);
+		vty_out(vty, " %02x", STREAM_DATA(s)[j]);
+		if (j % 16 == 15 || j == dump_len - 1)
+			vty_out(vty, "\n");
+	}
+}
+
+static void zebra_show_iobuf_fifo(struct vty *vty, struct stream_fifo *fifo, pthread_mutex_t *mtx,
+				  const char *label, bool brief, bool detail, uint32_t first_n)
+{
+	struct stream *s;
+	size_t count;
+	uint32_t n_msgs = 0;
+	/* Sized by ZEBRA_MSG_MAX -- see lib/zclient.h */
+	uint32_t counts[ZEBRA_MSG_MAX] = {};
+	struct stream **msgs = NULL;
+
+	frr_with_mutex (mtx) {
+		count = fifo->count;
+
+		if (count == 0)
+			goto done;
+
+		if (brief) {
+			for (s = stream_fifo_head(fifo); s && n_msgs < first_n;
+			     s = s->next, n_msgs++) {
+				uint16_t cmd = stream_getw_from(s, ZAPI_HEADER_CMD_LOCATION);
+				if (cmd < ZEBRA_MSG_MAX)
+					counts[cmd]++;
+			}
+		} else {
+			msgs = XCALLOC(MTYPE_TMP, MIN(first_n, count) * sizeof(struct stream *));
+
+			for (s = stream_fifo_head(fifo); s && n_msgs < first_n;
+			     s = s->next, n_msgs++)
+				msgs[n_msgs] = stream_dup(s);
+		}
+done:;
+	}
+
+	vty_out(vty, "  %s Fifo: %zu queued", label, count);
+	if (count > first_n)
+		vty_out(vty, " (showing first %u)", first_n);
+	vty_out(vty, "\n");
+
+	if (count == 0)
+		return;
+
+	if (brief) {
+		for (uint16_t i = 0; i < array_size(counts); i++) {
+			if (counts[i])
+				vty_out(vty, "    %-30s %u\n", zserv_command_string(i), counts[i]);
+		}
+	} else {
+		for (uint32_t i = 0; i < n_msgs; i++) {
+			uint16_t cmd = stream_getw_from(msgs[i], ZAPI_HEADER_CMD_LOCATION);
+
+			if (detail) {
+				uint16_t len = stream_getw_from(msgs[i], 0);
+				uint32_t vrf_id = stream_getl_from(msgs[i], 4);
+
+				vty_out(vty, "    [%3u] %-30s vrf=%u  len=%u\n", i + 1,
+					zserv_command_string(cmd), vrf_id, len);
+
+				stream_set_getp(msgs[i], ZEBRA_HEADER_SIZE);
+
+				if (cmd < ZEBRA_MSG_MAX && zapi_msg_show_fns[cmd])
+					zapi_msg_show_fns[cmd](vty, msgs[i], len);
+				else
+					zapi_msg_show_hexdump(vty, msgs[i], 64);
+			} else {
+				vty_out(vty, "    [%3u] %s\n", i + 1, zserv_command_string(cmd));
+			}
+			stream_free(msgs[i]);
+		}
+		XFREE(MTYPE_TMP, msgs);
+	}
+}
+
+static void zebra_show_client_fifo(struct vty *vty, struct zserv *client, bool show_input,
+				   bool brief, bool detail, uint32_t first_n)
+{
+	vty_out(vty, "Client: %s", zebra_route_string(client->proto));
+	if (client->instance)
+		vty_out(vty, " Instance: %u", client->instance);
+	if (client->session_id)
+		vty_out(vty, " [%u]", client->session_id);
+	vty_out(vty, "\n");
+
+	if (show_input)
+		zebra_show_iobuf_fifo(vty, client->ibuf_fifo, &client->ibuf_mtx, "Input", brief,
+				      detail, first_n);
+	else
+		zebra_show_iobuf_fifo(vty, client->obuf_fifo, &client->obuf_mtx, "Output", brief,
+				      detail, first_n);
+	vty_out(vty, "\n");
+}
+
+DEFUN (show_zebra_client_fifo,
+       show_zebra_client_fifo_cmd,
+       "show zebra client [WORD] <input|output> fifo [first (1-5000)] [brief|detail]",
+       SHOW_STR
+       ZEBRA_STR
+       "Client information\n"
+       "Client name (e.g. bgp, ospf, static)\n"
+       "Input FIFO (client to zebra)\n"
+       "Output FIFO (zebra to client)\n"
+       "FIFO queue contents\n"
+       "Limit messages shown\n"
+       "Number of messages\n"
+       "Aggregate stats per message type\n"
+       "Per-message details with decoded fields\n")
+{
+	struct zserv *client;
+	int filter_proto = -1;
+	bool show_input = false;
+	bool brief = false;
+	bool detail = false;
+	uint32_t first_n = 100;
+	int idx = 0;
+
+	if (argv_find(argv, argc, "WORD", &idx)) {
+		filter_proto = proto_name2num(argv[idx]->arg);
+		if (filter_proto < 0) {
+			vty_out(vty, "%% Unknown client name: %s\n", argv[idx]->arg);
+			return CMD_WARNING;
+		}
+	}
+
+	idx = 0;
+	if (argv_find(argv, argc, "input", &idx))
+		show_input = true;
+
+	idx = 0;
+	if (argv_find(argv, argc, "brief", &idx))
+		brief = true;
+
+	idx = 0;
+	if (argv_find(argv, argc, "detail", &idx))
+		detail = true;
+
+	idx = 0;
+	if (argv_find(argv, argc, "first", &idx))
+		first_n = strtoul(argv[idx + 1]->arg, NULL, 10);
+
+	frr_each (zserv_client_list, &zrouter.client_list, client) {
+		if (filter_proto >= 0 && client->proto != (uint8_t)filter_proto)
+			continue;
+		zebra_show_client_fifo(vty, client, show_input, brief, detail, first_n);
+	}
+
+	return CMD_SUCCESS;
+}
+
+
 static int zserv_client_close_cb(struct zserv *closed_client)
 {
 	struct zserv *client = NULL;
@@ -1700,6 +1874,25 @@ static int zserv_client_close_cb(struct zserv *closed_client)
 	return 0;
 }
 
+/*
+ * Register ZAPI message detail formatters for "show zebra client fifo detail".
+ * Add new entries here when implementing formatters for other message types.
+ */
+static void zapi_msg_show_init(void)
+{
+	zapi_msg_show_fns[ZEBRA_ROUTE_ADD] = zapi_route_show;
+	zapi_msg_show_fns[ZEBRA_ROUTE_DELETE] = zapi_route_show;
+	zapi_msg_show_fns[ZEBRA_REDISTRIBUTE_ROUTE_ADD] = zapi_route_show;
+	zapi_msg_show_fns[ZEBRA_REDISTRIBUTE_ROUTE_DEL] = zapi_route_show;
+	zapi_msg_show_fns[ZEBRA_NEXTHOP_UPDATE] = zapi_nexthop_update_show;
+	zapi_msg_show_fns[ZEBRA_NEXTHOP_REGISTER] = zapi_rnh_register_show;
+	zapi_msg_show_fns[ZEBRA_NEXTHOP_UNREGISTER] = zapi_rnh_register_show;
+	zapi_msg_show_fns[ZEBRA_INTERFACE_ADD] = zapi_interface_show;
+	zapi_msg_show_fns[ZEBRA_INTERFACE_DELETE] = zapi_interface_show;
+	zapi_msg_show_fns[ZEBRA_INTERFACE_UP] = zapi_interface_show;
+	zapi_msg_show_fns[ZEBRA_INTERFACE_DOWN] = zapi_interface_show;
+}
+
 void zserv_init(void)
 {
 	/* Client list init. */
@@ -1712,6 +1905,9 @@ void zserv_init(void)
 
 	install_element(ENABLE_NODE, &show_zebra_client_cmd);
 	install_element(ENABLE_NODE, &show_zebra_client_summary_cmd);
+	install_element(ENABLE_NODE, &show_zebra_client_fifo_cmd);
+
+	zapi_msg_show_init();
 
 	hook_register(zserv_client_close, zserv_client_close_cb);
 }

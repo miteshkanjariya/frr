@@ -25,6 +25,7 @@
 #include "lib/libfrr.h"
 #include "lib/lib_errors.h"
 #include "lib/frrdistance.h"
+#include "lib/vty.h"
 
 #include "zebra/zebra_router.h"
 #include "zebra/rib.h"
@@ -4321,4 +4322,75 @@ continue_loop:
 		zebra_opaque_enqueue_batch(&temp_fifo);
 
 	stream_fifo_deinit(&temp_fifo);
+}
+
+/*
+ * ZAPI message detail formatters for "show zebra client fifo detail".
+ * Stream getp is at ZEBRA_HEADER_SIZE when called.
+ */
+
+void zapi_interface_show(struct vty *vty, struct stream *s, uint16_t length)
+{
+	char ifname[IFNAMSIZ];
+	uint32_t ifindex;
+	uint8_t status;
+	uint64_t flags;
+	uint32_t metric, speed, mtu;
+
+	STREAM_GET(ifname, s, IFNAMSIZ);
+	ifname[IFNAMSIZ - 1] = '\0';
+	STREAM_GETL(s, ifindex);
+	STREAM_GETC(s, status);
+	STREAM_GETQ(s, flags);
+	/* skip ptm_enable, ptm_status */
+	stream_forward_getp(s, 2);
+	STREAM_GETL(s, metric);
+	STREAM_GETL(s, speed);
+	/* skip txqlen */
+	stream_forward_getp(s, 4);
+	STREAM_GETL(s, mtu);
+
+	vty_out(vty, "         name=%s ifindex=%u status=0x%x flags=0x%" PRIx64 "\n", ifname,
+		ifindex, status, flags);
+	vty_out(vty, "         metric=%u speed=%u mtu=%u\n", metric, speed, mtu);
+	return;
+
+stream_failure:
+	vty_out(vty, "         (decode error)\n");
+}
+
+void zapi_rnh_register_show(struct vty *vty, struct stream *s, uint16_t length)
+{
+	uint16_t payload_len = length - ZEBRA_HEADER_SIZE;
+	uint16_t consumed = 0;
+	uint32_t idx = 0;
+	uint8_t connected, resolve_via_default;
+	safi_t safi;
+	struct prefix p;
+
+	while (consumed < payload_len) {
+		STREAM_GETC(s, connected);
+		STREAM_GETC(s, resolve_via_default);
+		STREAM_GETW(s, safi);
+		STREAM_GETW(s, p.family);
+		STREAM_GETC(s, p.prefixlen);
+		consumed += 7;
+
+		if (p.family == AF_INET) {
+			STREAM_GET(&p.u.prefix4.s_addr, s, IPV4_MAX_BYTELEN);
+			consumed += IPV4_MAX_BYTELEN;
+		} else if (p.family == AF_INET6) {
+			STREAM_GET(&p.u.prefix6, s, IPV6_MAX_BYTELEN);
+			consumed += IPV6_MAX_BYTELEN;
+		} else {
+			break;
+		}
+
+		vty_out(vty, "         [%u] %pFX safi=%s connected=%s\n", idx++, &p,
+			safi2str(safi), connected ? "yes" : "no");
+	}
+	return;
+
+stream_failure:
+	vty_out(vty, "         (decode error)\n");
 }

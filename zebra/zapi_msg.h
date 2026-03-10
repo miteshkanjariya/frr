@@ -106,6 +106,10 @@ int zsend_nhg_notify(uint16_t type, uint16_t instance, uint32_t session_id,
 
 extern void zapi_re_opaque_free(struct route_entry *re);
 
+/* ZAPI message detail formatters for "show zebra client fifo detail" */
+extern void zapi_interface_show(struct vty *vty, struct stream *s, uint16_t length);
+extern void zapi_rnh_register_show(struct vty *vty, struct stream *s, uint16_t length);
+
 extern int zsend_zebra_srv6_locator_add(struct zserv *client,
 					struct srv6_locator *loc);
 extern int zsend_zebra_srv6_locator_delete(struct zserv *client,

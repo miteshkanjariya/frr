@@ -28,6 +28,7 @@
 #include "srte.h"
 #include "printfrr.h"
 #include "srv6.h"
+#include "vty.h"
 
 DEFINE_MTYPE_STATIC(LIB, ZCLIENT, "Zclient");
 DEFINE_MTYPE_STATIC(LIB, REDIST_INST, "Redistribution instance IDs");
@@ -2558,8 +2559,7 @@ const char *zapi_nexthop2str(const struct zapi_nexthop *znh, char *buf,
 /*
  * Decode the nexthop-tracking update message
  */
-static bool zapi_nexthop_update_decode(struct stream *s, struct prefix *match,
-				       struct zapi_route *nhr)
+bool zapi_nexthop_update_decode(struct stream *s, struct prefix *match, struct zapi_route *nhr)
 {
 	uint32_t i;
 
@@ -5452,4 +5452,113 @@ void zclient_neigh_get(struct zclient *zclient, struct interface *ifp, afi_t afi
 
 	stream_putw_at(s, 0, stream_get_endp(s));
 	zclient_send_message(zclient);
+}
+
+/*
+ * ZAPI message detail formatters for "show zebra client fifo detail".
+ * Stream getp is at ZEBRA_HEADER_SIZE when called.
+ */
+
+static void zapi_nexthop_show_one(struct vty *vty, const struct zapi_nexthop *nh)
+{
+	switch (nh->type) {
+	case NEXTHOP_TYPE_IPV4:
+	case NEXTHOP_TYPE_IPV4_IFINDEX:
+		vty_out(vty, "%pI4", &nh->gate.ipv4);
+		if (nh->type == NEXTHOP_TYPE_IPV4_IFINDEX)
+			vty_out(vty, " if=%u", nh->ifindex);
+		break;
+	case NEXTHOP_TYPE_IPV6:
+	case NEXTHOP_TYPE_IPV6_IFINDEX:
+		vty_out(vty, "%pI6", &nh->gate.ipv6);
+		if (nh->type == NEXTHOP_TYPE_IPV6_IFINDEX)
+			vty_out(vty, " if=%u", nh->ifindex);
+		break;
+	case NEXTHOP_TYPE_IFINDEX:
+		vty_out(vty, "if=%u", nh->ifindex);
+		break;
+	case NEXTHOP_TYPE_BLACKHOLE:
+		vty_out(vty, "blackhole");
+		break;
+	}
+	if (nh->label_num)
+		vty_out(vty, " labels=%u", nh->label_num);
+}
+
+void zapi_route_show(struct vty *vty, struct stream *s, uint16_t length)
+{
+	struct zapi_route api;
+	char flag_buf[128];
+	uint16_t i;
+
+	if (zapi_route_decode(s, &api) < 0) {
+		vty_out(vty, "         (decode error)\n");
+		return;
+	}
+
+	vty_out(vty, "         type=%s prefix=%pFX safi=%s\n", zebra_route_string(api.type),
+		&api.prefix, safi2str(api.safi));
+
+	if (api.flags) {
+		zclient_dump_route_flags(api.flags, flag_buf, sizeof(flag_buf));
+		vty_out(vty, "         flags: %s\n", flag_buf);
+	}
+
+	if (CHECK_FLAG(api.message, ZAPI_MESSAGE_DISTANCE) ||
+	    CHECK_FLAG(api.message, ZAPI_MESSAGE_METRIC)) {
+		vty_out(vty, "        ");
+		if (CHECK_FLAG(api.message, ZAPI_MESSAGE_DISTANCE))
+			vty_out(vty, " distance=%u", api.distance);
+		if (CHECK_FLAG(api.message, ZAPI_MESSAGE_METRIC))
+			vty_out(vty, " metric=%u", api.metric);
+		if (CHECK_FLAG(api.message, ZAPI_MESSAGE_TAG))
+			vty_out(vty, " tag=%u", api.tag);
+		if (CHECK_FLAG(api.message, ZAPI_MESSAGE_MTU))
+			vty_out(vty, " mtu=%u", api.mtu);
+		if (CHECK_FLAG(api.message, ZAPI_MESSAGE_TABLEID))
+			vty_out(vty, " table=%u", api.tableid);
+		vty_out(vty, "\n");
+	}
+
+	if (CHECK_FLAG(api.message, ZAPI_MESSAGE_NHG))
+		vty_out(vty, "         nhg-id=%u\n", api.nhgid);
+
+	if (CHECK_FLAG(api.message, ZAPI_MESSAGE_NEXTHOP)) {
+		for (i = 0; i < api.nexthop_num; i++) {
+			vty_out(vty, "         nh[%u]: ", i);
+			zapi_nexthop_show_one(vty, &api.nexthops[i]);
+			vty_out(vty, "\n");
+		}
+	}
+
+	if (CHECK_FLAG(api.message, ZAPI_MESSAGE_BACKUP_NEXTHOPS)) {
+		for (i = 0; i < api.backup_nexthop_num; i++) {
+			vty_out(vty, "         bk[%u]: ", i);
+			zapi_nexthop_show_one(vty, &api.backup_nexthops[i]);
+			vty_out(vty, "\n");
+		}
+	}
+}
+
+void zapi_nexthop_update_show(struct vty *vty, struct stream *s, uint16_t length)
+{
+	struct prefix match;
+	struct zapi_route nhr;
+	uint32_t i;
+
+	if (!zapi_nexthop_update_decode(s, &match, &nhr)) {
+		vty_out(vty, "         (decode error)\n");
+		return;
+	}
+
+	vty_out(vty, "         match=%pFX resolved=%pFX type=%s\n", &match, &nhr.prefix,
+		zebra_route_string(nhr.type));
+	vty_out(vty, "         distance=%u metric=%u nexthops=%u\n", nhr.distance, nhr.metric,
+		nhr.nexthop_num);
+
+	for (i = 0; i < nhr.nexthop_num; i++) {
+		vty_out(vty, "         nh[%u]: ", i);
+		zapi_nexthop_show_one(vty, &nhr.nexthops[i]);
+		vty_out(vty, "\n");
+	}
 }

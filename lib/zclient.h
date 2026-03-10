@@ -7,6 +7,7 @@
 #define _ZEBRA_ZCLIENT_H
 
 struct zclient;
+struct vty;
 
 /* For struct zapi_route. */
 #include "prefix.h"
@@ -87,8 +88,9 @@ enum zserv_client_capabilities {
 extern struct sockaddr_storage zclient_addr;
 extern socklen_t zclient_addr_len;
 
-/* Zebra message types. Please update the corresponding
- * command_types array with any changes!
+/* Zebra message types. When adding new entries:
+ *   - add new types above ZEBRA_MSG_MAX
+ *   - update command_types array
  */
 typedef enum {
 	ZEBRA_INTERFACE_ADD,
@@ -238,6 +240,7 @@ typedef enum {
 	ZEBRA_TC_FILTER_DELETE,
 	ZEBRA_OPAQUE_NOTIFY,
 	ZEBRA_SRV6_SID_NOTIFY,
+	ZEBRA_MSG_MAX,
 } zebra_message_types_t;
 /* Zebra message types. Please update the corresponding
  * command_types array with any changes!
@@ -1233,6 +1236,26 @@ const char *zapi_nexthop2str(const struct zapi_nexthop *znh, char *buf,
 
 /* Decode the zebra error message */
 extern bool zapi_error_decode(struct stream *s, enum zebra_error_types *error);
+
+extern bool zapi_nexthop_update_decode(struct stream *s, struct prefix *match,
+				       struct zapi_route *nhr);
+
+/*
+ * ZAPI message detail formatter for "show zebra client fifo detail".
+ *
+ * Called with stream getp at ZEBRA_HEADER_SIZE (just past the header).
+ * @length is the total message length from the header (including header).
+ * Formatter prints indented detail lines via vty_out().
+ *
+ * To add a formatter for a new message type:
+ *   1. Write: void my_msg_show(struct vty *, struct stream *, uint16_t)
+ *   2. Declare it in the appropriate header
+ *   3. Register in zserv_init(): zapi_msg_show[ZEBRA_MY_MSG] = my_msg_show
+ */
+typedef void (*zapi_msg_show_t)(struct vty *vty, struct stream *s, uint16_t length);
+
+extern void zapi_route_show(struct vty *vty, struct stream *s, uint16_t length);
+extern void zapi_nexthop_update_show(struct vty *vty, struct stream *s, uint16_t length);
 
 /* Encode and decode restart capabilities */
 extern enum zclient_send_status
